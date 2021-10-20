@@ -8,6 +8,9 @@ makes it a good testbed for predicate invention.
 from typing import List, Set, Sequence, Dict, Tuple, Optional
 import numpy as np
 from gym.spaces import Box
+import pybullet as p
+from predicators.src.envs.pybullet_utils import get_kinematic_chain, \
+    inverse_kinematics, get_asset_path
 from predicators.src.envs import BaseEnv
 from predicators.src.structs import Type, Predicate, State, Task, \
     ParameterizedOption, Object, Action, GroundAtom, Image, Array
@@ -74,6 +77,11 @@ class BlocksEnv(BaseEnv):
             _terminal=self._PutOnTable_terminal)
         # Objects
         self._robot = Object("robby", self._robot_type)
+        # Rendering
+        if CFG.make_videos:
+            self._obj_to_pybullet_obj = {}
+            self._last_pb_state = {"gripper": np.array([0.9, 0.3, 0.3])}
+            self._initialize_pybullet()
 
     def simulate(self, state: State, action: Action) -> State:
         assert self.action_space.contains(action.arr)
@@ -205,8 +213,26 @@ class BlocksEnv(BaseEnv):
         return Box(lowers, uppers)
 
     def render(self, state: State, task: Task,
-               action: Optional[Action] = None) -> Image:
-        raise NotImplementedError
+               action: Optional[Action] = None) -> List[Image]:
+        assert CFG.make_videos
+        print("RENDERING")
+        blocks = [o for o in state if o.type == self._block_type]
+        if not self._obj_to_pybullet_obj:
+            self._rebuild_pybullet_objects(blocks)
+        if action is None:
+            # Nothing to render, since we're using simulate. Set up for
+            # the next episode.
+            self._rebuild_pybullet_objects(blocks)
+            self._last_pb_state = {"gripper": np.array([0.9, 0.3, 0.3])}
+            return []
+        # Render in between state and next_state
+        next_state = self.simulate(state, action)
+        pbtraj = self._get_interpolated_pybullet_states(state, next_state)
+        images = []
+        for pb_state in pbtraj:
+            self._update_pybullet_state(pb_state)
+            images.append(self._get_pybullet_image())
+        return images
 
     def _get_tasks(self, num_tasks: int, possible_num_blocks: List[int],
                    rng: np.random.Generator) -> List[Task]:
@@ -446,3 +472,297 @@ class BlocksEnv(BaseEnv):
         if not blocks_here:
             return None
         return max(blocks_here, key=lambda x: x[1])[0]  # highest z
+
+    def _initialize_pybullet(self):
+        # Load things into environment.
+        if not p.getConnectionInfo()["isConnected"]:
+            self._physics_client_id = p.connect(p.GUI)
+            self._reset_camera()
+            p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0,
+                                       physicsClientId=self._physics_client_id)
+            p.resetSimulation(physicsClientId=self._physics_client_id)
+            p.setAdditionalSearchPath("src/envs/assets/")
+            p.loadURDF(get_asset_path("urdf/plane.urdf"), [0, 0, -1],
+                       useFixedBase=True,
+                       physicsClientId=self._physics_client_id)
+            self._fetch_id = p.loadURDF(
+                get_asset_path("urdf/robots/fetch.urdf"), useFixedBase=True,
+                physicsClientId=self._physics_client_id)
+            global PHYSICS_CLIENT_ID, FETCH_ID  # pylint:disable=global-variable-undefined
+            PHYSICS_CLIENT_ID = self._physics_client_id
+            FETCH_ID = self._fetch_id
+        else:
+            self._physics_client_id = PHYSICS_CLIENT_ID
+            self._fetch_id = FETCH_ID
+        base_position = [0.8, 0.7441, 0]
+        base_orientation = [0., 0., 0., 1.]
+        p.resetBasePositionAndOrientation(
+            self._fetch_id, base_position, base_orientation,
+            physicsClientId=self._physics_client_id)
+        # Get joints info.
+        joint_names = [p.getJointInfo(
+            self._fetch_id, i,
+            physicsClientId=self._physics_client_id)[1].decode("utf-8")
+                       for i in range(p.getNumJoints(
+                           self._fetch_id,
+                           physicsClientId=self._physics_client_id))]
+        self._ee_id = joint_names.index("gripper_axis")
+        self._ee_orn_down = p.getQuaternionFromEuler((0, np.pi/2, -np.pi))
+        self._ee_orn_side = p.getQuaternionFromEuler((0, 0, 0))
+        self._arm_joints = get_kinematic_chain(
+            self._fetch_id, self._ee_id,
+            physics_client_id=self._physics_client_id)
+        self._left_finger_id = joint_names.index("l_gripper_finger_joint")
+        self._right_finger_id = joint_names.index("r_gripper_finger_joint")
+        self._arm_joints.append(self._left_finger_id)
+        self._arm_joints.append(self._right_finger_id)
+        self._init_joint_values = inverse_kinematics(
+            self._fetch_id, self._ee_id, [1., 0, 0.75], self._ee_orn_down,
+            self._arm_joints, physics_client_id=self._physics_client_id)
+        # Add table.
+        table_urdf = get_asset_path("urdf/table.urdf")
+        self._table_id = p.loadURDF(table_urdf, useFixedBase=True,
+                                    physicsClientId=self._physics_client_id)
+        p.resetBasePositionAndOrientation(
+            self._table_id, (1.65, 0.5, 0.0), [0., 0., 0., 1.],
+            physicsClientId=self._physics_client_id)
+
+    def _get_pybullet_image(self):
+        camera_distance, yaw, pitch, camera_target = self._get_camera_params()
+        view_matrix = p.computeViewMatrixFromYawPitchRoll(
+            cameraTargetPosition=camera_target,
+            distance=camera_distance,
+            yaw=yaw,
+            pitch=pitch,
+            roll=0,
+            upAxisIndex=2,
+            physicsClientId=self._physics_client_id)
+
+        width = height = 1800
+
+        proj_matrix = p.computeProjectionMatrixFOV(
+            fov=60, aspect=float(width / height),
+            nearVal=0.1, farVal=100.0,
+            physicsClientId=self._physics_client_id)
+
+        (_, _, px, _, _) = p.getCameraImage(
+            width=width, height=height, viewMatrix=view_matrix,
+            projectionMatrix=proj_matrix,
+            renderer=p.ER_BULLET_HARDWARE_OPENGL,
+            physicsClientId=self._physics_client_id)
+
+        rgb_array = np.array(px).reshape((width, height, 4))
+        rgb_array = rgb_array[:, :, :3]
+        return rgb_array
+
+    @staticmethod
+    def _get_camera_params():
+        camera_distance = 1.65
+        yaw = 90
+        pitch = -5
+        camera_target = [1.05, 0.5, 0.42]
+        return camera_distance, yaw, pitch, camera_target
+
+    def _reset_camera(self):
+        camera_distance, yaw, pitch, camera_target = self._get_camera_params()
+        p.resetDebugVisualizerCamera(
+            camera_distance, yaw, pitch,
+            camera_target, physicsClientId=self._physics_client_id)
+
+    def _update_pybullet_state(self, pb_state):
+        grip = pb_state["gripper"]
+        active_constraint = pb_state["constraint"]
+        block_states = {k: v for k, v in pb_state.items()
+                        if k not in ["gripper", "constraint"]}
+
+        target_position = np.add(grip, [0.0, 0.0, 0.075])
+        ee_orien_to_use = self._ee_orn_down
+        hint_joint_values = [
+            0.47979457172467466, -1.576409316226008,
+            1.8756301813146756, 0.8320363798078769,
+            1.3659745447630645, -0.22762065844250637,
+            -0.32964011684942474, 0.034577873746798826,
+            0.03507221623551996]
+        # Trick to make IK work: reset to either
+        # side grasp or top grasp general position
+        for joint_idx, joint_val in zip(self._arm_joints,
+                                        hint_joint_values):
+            p.resetJointState(self._fetch_id, joint_idx, joint_val,
+                              physicsClientId=self._physics_client_id)
+
+        # Target gripper
+        joint_values = inverse_kinematics(
+            self._fetch_id, self._ee_id, target_position,
+            ee_orien_to_use, self._arm_joints,
+            physics_client_id=self._physics_client_id)
+        for joint_idx, joint_val in zip(self._arm_joints, joint_values):
+            p.resetJointState(self._fetch_id, joint_idx, joint_val,
+                              physicsClientId=self._physics_client_id)
+
+        # Close fingers if holding
+        finger_val = 0.05
+        for finger_idx in [self._left_finger_id, self._right_finger_id]:
+            p.resetJointState(self._fetch_id, finger_idx, finger_val,
+                              physicsClientId=self._physics_client_id)
+
+        for obj, py_obj in self._obj_to_pybullet_obj.items():
+            if active_constraint is not None and \
+                obj == active_constraint[0]:
+                pose, orn = self._apply_pick_constraint(active_constraint)
+            else:
+                pose = block_states[obj].copy()
+                orn = [0, 0, 0, 1]
+            p.resetBasePositionAndOrientation(
+                py_obj, pose, orn,
+                physicsClientId=self._physics_client_id)
+
+    def _apply_pick_constraint(self, active_constraint):
+        base_link = np.r_[p.getLinkState(
+            self._fetch_id, self._ee_id,
+            physicsClientId=self._physics_client_id)[:2]]
+        _, transf = active_constraint
+        obj_loc, orn = p.multiplyTransforms(
+            base_link[:3], base_link[3:], transf[0], transf[1])
+        return obj_loc, orn
+
+    def _rebuild_pybullet_objects(self, blocks):
+        # Remove any existing objects.
+        for obj_id in self._obj_to_pybullet_obj.values():
+            p.removeBody(obj_id, physicsClientId=self._physics_client_id)
+        self._obj_to_pybullet_obj = {}
+        # Add new blocks.
+        colors = [
+            (0.95, 0.05, 0.1, 1.),
+            (0.05, 0.95, 0.1, 1.),
+            (0.1, 0.05, 0.95, 1.),
+            (0.4, 0.05, 0.6, 1.),
+            (0.6, 0.4, 0.05, 1.),
+            (0.05, 0.04, 0.6, 1.),
+            (0.95, 0.95, 0.1, 1.),
+            (0.95, 0.05, 0.95, 1.),
+            (0.05, 0.95, 0.95, 1.),
+        ]
+        for i, block in enumerate(blocks):
+            assert block.type == self._block_type
+            color = colors[i%len(colors)]
+            width = CFG.blocks_block_size
+            length = CFG.blocks_block_size
+            height = CFG.blocks_block_size
+            mass, friction = 0.04, 1.2
+            orn_x, orn_y, orn_z, orn_w = 0, 0, 0, 1
+            half_extents = [width/2, length/2, height/2]
+            collision_id = p.createCollisionShape(
+                p.GEOM_BOX, halfExtents=half_extents,
+                physicsClientId=self._physics_client_id)
+            visual_id = p.createVisualShape(
+                p.GEOM_BOX, halfExtents=half_extents, rgbaColor=color,
+                physicsClientId=self._physics_client_id)
+            block_id = p.createMultiBody(
+                baseMass=mass, baseCollisionShapeIndex=collision_id,
+                baseVisualShapeIndex=visual_id, basePosition=[0, 0, 0],
+                baseOrientation=[orn_x, orn_y, orn_z, orn_w],
+                physicsClientId=self._physics_client_id)
+            p.changeDynamics(block_id, -1, lateralFriction=friction,
+                             physicsClientId=self._physics_client_id)
+            self._obj_to_pybullet_obj[block] = block_id
+
+    def _get_interpolated_pybullet_states(self, state, next_state):
+        num_interp = 3#TODO:36
+
+        manipulated_block = None
+        free_blocks = []
+        for obj in state:
+            if obj.type != self._block_type:
+                continue
+            if state.get(obj, "held") > self.held_tol or \
+               next_state.get(obj, "held") > self.held_tol:
+                assert manipulated_block is None, "Multiple blocks held?!"
+                manipulated_block = obj
+            else:
+                free_blocks.append(obj)
+
+        # Interpolate block states
+        block_to_traj = {}
+        for block in free_blocks + [manipulated_block]:
+            block_traj = np.array([[state.get(block, "pose_x"),
+                                    state.get(block, "pose_y"),
+                                    state.get(block, "pose_z")]
+                                   for _ in range(num_interp)])
+            block_traj[:, 1] /= 20  # NOTE: compensate for scaled-up y_ub
+            z_pose = state.get(block, "pose_z")
+            if z_pose > self.lift_amt:
+                z_pose -= self.lift_amt
+            block_traj[:, 2] = z_pose
+            block_to_traj[block] = block_traj
+
+        assert manipulated_block is not None, "No block manipulated"
+
+        # Detect whether pick or place
+        held_before = state.get(manipulated_block, "held") > self.held_tol
+        held_after = next_state.get(manipulated_block, "held") > self.held_tol
+        assert not (held_before and held_after)
+        # Pick
+        if held_after:
+            constraint = None
+        # Place:
+        else:
+            assert held_before
+            tf = ((0.12, 0.0, 0.0), (0.7, 0.0, -0.7, 0.0))
+            constraint = (manipulated_block, tf)
+            block_to_traj[manipulated_block][-1] = np.array([
+                next_state.get(manipulated_block, "pose_x"),
+                next_state.get(manipulated_block, "pose_y"),
+                next_state.get(manipulated_block, "pose_z")])
+            block_to_traj[manipulated_block][-1][1] /= 20
+
+        # Get gripper trajectory
+        start_gripper_pose = self._last_pb_state['gripper']
+        end_gripper_pose = np.array([
+            next_state.get(manipulated_block, "pose_x"),
+            next_state.get(manipulated_block, "pose_y"),
+            next_state.get(manipulated_block, "pose_z")])
+        end_gripper_pose[1] /= 20
+        if end_gripper_pose[2] > self.lift_amt:
+            end_gripper_pose[2] -= self.lift_amt
+        if held_after:
+            end_gripper_pose[2] -= 0.05
+
+        # Use fixed up/down movements between waypoints
+        wp_height = -np.inf
+        for block, traj in block_to_traj.items():
+            wp_height = max(wp_height, max(traj[:, 2])+0.05)
+        waypoint1 = start_gripper_pose.copy()
+        waypoint1[2] = wp_height
+        waypoint2 = end_gripper_pose.copy()
+        waypoint2[2] = wp_height
+        waypoints = [
+            start_gripper_pose,
+            waypoint1,
+            waypoint2,
+            end_gripper_pose,
+        ]
+        assert num_interp % (len(waypoints)-1) == 0
+        num_interp_per_wp = num_interp // (len(waypoints)-1)
+        gripper_traj = []
+        for wp1, wp2 in zip(waypoints[:-1], waypoints[1:]):
+            gripper_traj.extend(np.linspace(wp1, wp2, num_interp_per_wp))
+        assert len(gripper_traj) == num_interp
+
+        # Uncomment to use linear interpolation instead
+        # gripper_traj = np.linspace(
+        #     self._last_pb_state['gripper'],
+        #     end_gripper_pose,
+        #     num_interp)
+
+        # Create pybullet state trajectory
+        final_traj = []
+        for t in range(num_interp):
+            s_t = {"gripper": gripper_traj[t],
+                   "constraint": constraint if t < num_interp - 1 else None}
+            for block, traj in block_to_traj.items():
+                s_t[block] = traj[t]
+            final_traj.append(s_t)
+
+        self._last_pb_state = {"gripper": gripper_traj[-1]}
+
+        return final_traj

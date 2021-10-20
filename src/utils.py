@@ -93,21 +93,26 @@ def run_policy_on_task(policy: Callable[[State], Action], task: Task,
             act = policy(state)
             if make_video:
                 assert render is not None
-                video.append(render(state, task, act))
+                video.extend(render(state, task, act))
             state = simulator(state, act)
             atoms = abstract(state, predicates)
+            print(state)
+            print(act)
+            print(atoms)
+            print()
             actions.append(act)
             states.append(state)
             if task.goal.issubset(atoms):
                 goal_reached = True
                 break
+    1/0
     if make_video:
         assert render is not None
         # Explanation of type ignore: mypy currently does not
         # support Callables with optional arguments. mypy
         # extensions does, but for the sake of avoiding an
         # additional dependency, we'll just ignore this here.
-        video.append(render(state, task))  # type: ignore
+        video.extend(render(state, task))  # type: ignore
     return (states, actions), video, goal_reached
 
 
