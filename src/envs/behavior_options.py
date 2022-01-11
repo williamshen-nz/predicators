@@ -249,12 +249,34 @@ def create_navigate_policy(
 
 
 def create_navigate_policy_model(
-    _plan: List[Tuple[float]]
+    plan: List[Tuple[float]]
 ) -> Callable[[State, "BehaviorEnv"], Tuple[Dict, bool]]:
     """Instantiates and returns an option model (which 'magics' the world to
     the final state in the plan without having to step through the closed-loop
     controller) for navigation given an RRT plan."""
-    pass  # pylint:disable=unnecessary-pass
+    def navigateToOptionModel(
+        _init_state: State, env: BehaviorEnv
+    ) -> Tuple[Dict, bool]:
+        robot_z = env._env.robots[0].get_position()[2]
+        target_pos = np.array([plan[-1][0], plan[-1][1], robot_z])
+
+        robot_orn = p.getEulerFromQuaternion(
+            env._env.robots[0].get_orientation()
+        )
+        target_orn = p.getQuaternionFromEuler(
+            np.array(
+                [robot_orn[0], robot_orn[1], plan[-1][2]]
+            )
+        )
+        env._env.robots[0].set_position_orientation(
+            target_pos, target_orn
+        )
+        # this is running a zero action to step simulator
+        env._env.step(np.zeros(17))
+        final_state = env._current_ig_state_to_state()
+        return final_state, True
+
+    return navigateToOptionModel
 
 
 def navigate_to_obj_pos(
