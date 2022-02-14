@@ -15,7 +15,7 @@ for SEED in $(seq $START_SEED $((NUM_SEEDS+START_SEED-1))); do
     # python $FILE --experiment_id blocks_oracle --env blocks --approach oracle --seed $SEED
     # python $FILE --experiment_id painting_oracle --env painting --approach oracle --seed $SEED
     # python $FILE --experiment_id tools_oracle --env tools --approach oracle --seed $SEED
-    # python $FILE --experiment_id repeated_nextto_oracle --env repeated_nextto --approach oracle --seed $SEED
+    python $FILE --experiment_id repeated_nextto_oracle --env repeated_nextto --approach oracle --seed $SEED
 
     for NUM_TRAIN_TASKS in ${ALL_NUM_TRAIN_TASKS[@]}; do
         COMMON_ARGS="--seed $SEED --num_train_tasks $NUM_TRAIN_TASKS"
